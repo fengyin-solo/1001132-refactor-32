@@ -1,4 +1,7 @@
-"""残损登记接口：维护残损记录，覆盖确认定责、提交闭环、挂起记录等动作。"""
+"""残损登记接口：维护残损记录，覆盖确认定责、提交闭环、挂起记录等动作。
+
+定责结论一律来自服务端 DamageService 的统一口径，本层只透传，不另写判定。
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -6,14 +9,14 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 
 from app.schemas import ActionResult, EntryPayload, PageResult
-from app.services.damage import DamageService
+from app.services.damage import STATUS_ORDER, DamageService
 
 router = APIRouter(prefix="/api/damage", tags=["残损登记"])
 
 service = DamageService()
 
 LIST_FIELDS = ["残损编号", "关联箱号", "残损类型", "残损部位", "责任方", "发现时间", "登记人员", "残损状态"]
-STATUSES = ["待定责", "已定责", "处理中", "已闭环", "已挂起"]
+STATUSES = STATUS_ORDER
 
 
 @router.get("", response_model=PageResult[dict])
@@ -28,6 +31,19 @@ def list_entries(
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/stats")
+def liability_stats() -> dict[str, Any]:
+    """看板统计：待定责/处理中/本月闭环，口径与列表、详情完全一致。"""
+    return {"module": "damage", **service.stats()}
+
+
+@router.get("/export")
+def export_entries() -> dict[str, Any]:
+    """导出残损登记清单：返回当前过滤条件下的全量数据（含统一口径的定责结论）。"""
+    items, total = service.list_entries(page=1, size=10000)
+    return {"module": "damage", "total": total, "items": items}
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -45,21 +61,19 @@ def create_entry(payload: EntryPayload) -> ActionResult:
     entry, missing = service.create_entry(payload.values)
     if missing:
         return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
-    return ActionResult(ok=True, message="残损记录已登记", entry=entry)
+    return ActionResult(ok=True, message="残损记录已登记，等待按统一口径定责", entry=entry)
 
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
 def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
-    """对单条残损记录执行确认定责、提交闭环、挂起记录；不允许的动作会被拦下并说明原因。"""
+    """对单条残损记录执行确认定责、提交闭环、挂起记录；不允许的动作会被拦下并说明原因。
+
+    确认定责时服务端按唯一口径重算责任方，与提交值不一致以服务端为准；
+    已闭环记录一律拒绝改动，避免结论被改回待定责。
+    """
     action = str(payload.values.get("action") or "").strip()
-    entry, message = service.run_action(entry_id, action)
+    entry, level, message = service.run_action(entry_id, action, payload.values)
     if entry is None:
         return ActionResult(ok=False, message=message)
+    # level == "warn" 表示动作生效但结论以服务端口径修正，仍返回记录供页面刷新。
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出残损登记清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "damage", "total": total, "items": items}
